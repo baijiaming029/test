@@ -12,8 +12,8 @@ condition_variable productor_cv;
 condition_variable consumer_cv;
 void consumer(){
 
-    static int cnt = 10;
-    while(cnt--){
+    static int cnt = 100;
+    while(cnt-- >=0 ){
         unique_lock<mutex> lock(mtx);
         
         consumer_cv.wait(lock, []{
@@ -32,8 +32,8 @@ void consumer(){
 
 void productor(){
 
-    static int cnt = 10;
-    while(cnt--){
+    static int cnt = 100;
+    while(cnt-- >= 0){
         unique_lock<mutex> lock(mtx);
         
         productor_cv.wait(lock,[]{
@@ -41,7 +41,7 @@ void productor(){
         });
         
         msg_queue.push(cnt);
-        consumer_cv.notify_all();
+        consumer_cv.notify_one();
 
     }
 
@@ -51,11 +51,26 @@ void productor(){
 int main(){
 
 
-    thread c1(consumer);
-    thread c2(productor);
+    // thread c1(consumer);
+    // thread c4(consumer);
+    // thread c2(productor);
+    // thread c3(productor);
 
     c1.join();
     c2.join();
+
+    int a = 0x1234;
+
+    char c = (char)a;
+
+    if(c == 0x12){ //da
+
+    }
+    else if(c == 0x34){ //xiao
+
+    }
+
+
 
 
     return 0;

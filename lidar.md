@@ -602,5 +602,208 @@ static std::unique_ptr<ShmMessage> MakeSpinOnShm(LidarModel lidar_type) {
 
 ---
 
+
+发布一：PublishShmMsg(new_spin_shm) — 主数据，共享内存
+
+// spin_publisher_module.cc:2302-2309
+// 局部帧（partial spin）：
+lite_module_->PublishShmMsg(new_spin_shm);
+// 完整帧（full spin），带时间戳用于端到端延迟统计：
+lite_module_->PublishShmMsg(
+    new_spin_shm,
+    static_cast<int64_t>(new_spin->MidScan().timestamp * 1e6),
+    lidar_params_.installation().lidar_id());
+这是模块的核心发布，把拼好的 Spin（一帧点云）写入共享内存，感知模块直接读取，零拷贝。
+
+发布二：Publish(lidar_fault_message_proto_) — 故障码
+
+// spin_publisher_module.cc:673,685
+lite_module_->Publish(lidar_fault_message_proto_, "lidar_fault_message_proto");
+每 5 秒发一次，健康管理模块订阅。
+
+发布三：Publish(*lidar_multi_intrinsics_) — 雷达内参
+
+// spin_publisher_module.cc:2737
+this->Publish(*lidar_multi_intrinsics_);
+启动时一次性发布（one_shot=true，1 秒后触发），把所有雷达的内参（每条线束的仰角、方位角偏移等）发出去，供其他需要知道雷达几何参数的模块使用。
+
+注意点：仿真模式下没有 UDP，走订阅
+
+OnSubscribeChannels 里有一个分支：
+
+// spin_publisher_module.cc:2644-2697
+if (IsOnboardMode()) {
+    // 真实硬件：什么都不订阅（数据来自 UDP）
+    Subscribe(..., "pose_proto", 50);
+} else {
+    // 仿真/回放模式：订阅 "log_lidar_spin" 话题（来自 PCAP 回放）
+    Subscribe(..., "sensor_pose", 50);
+    SubscribeLidarFrame([this](const LidarFrame& lidar_frame) {
+        // 把读回来的帧重新走一遍 UpdateSpinAndPublishShm 发布出去
+        FindOrDie(spin_builders_, lidar_id)->UpdateSpinAndPublishShm(...);
+    }, "log_lidar_spin");
+}
+也就是说，真车上数据从 UDP 来，仿真/日志回放时数据从 log_lidar_spin 话题来，但最终都通过同一个 UpdateSpinAndPublishShm 发布到共享内存，下游感知看到的接口完全一样。
+
+
+原始 UDP 包（元数据）
+  ├─ range_tick（距离原始值）
+  ├─ raw_intensity（反射强度原始值）
+  └─ azimuth（水平角）
+           │
+           │ 拼帧（按角度/时间切帧）
+           ↓
+     Scan 数组（3600 条）
+           │
+           ├─── ① 位姿信息注入
+           │       └─ 订阅定位模块 pose_proto
+           │          → 按 scan.timestamp 线性插值
+           │          → 写入每条 scan.pose（x/y/z/yaw/pitch/roll）
+           │
+           ├─── ② 内参校正
+           │       ├─ 出厂内参：beam 仰角/方位偏置（per-beam 查找表）
+           │       ├─ 安装外参：雷达在车身上的位置和朝向
+           │       └─ 数学变换：极坐标 → 雷达系 → 车身系 → 世界系
+           │          → 写入每个 LaserShot.calibrated_returns.x/y/z
+           │
+           ├─── ③ 质量检查（帧完整性、时钟同步、有效点数）
+           │
+           └─── ④ 附加配置/设备信息（SHM 元数据头）
+                   ├─ lidar_id（哪个雷达）
+                   ├─ lidar_type（雷达型号）
+                   ├─ is_partial（是否局部帧）
+                   ├─ num_scans（当前帧扫描线数）
+                   └─ compat_version（版本兼容字段）
+                           │
+                           │ PublishShmMsg（共享内存，零拷贝
+
+## SpinPublisherModule 面试知识点
+
+---
+
+## 一、基础知识层
+
+### 1. UDP Socket（必问）
+
+**Q：为什么激光雷达用 UDP 不用 TCP？**
+
+> 雷达数据是实时流，丢一两个包比等待重传更可接受。TCP 的重传机制会引入不确定延迟，高帧率下（12,000 包/秒）延迟积累会导致数据失效。
+
+**Q：为什么 socket 设成非阻塞（O_NONBLOCK）？**
+
+> 接收线程需要主动控制睡眠和唤醒时机。阻塞模式下线程会卡在 `recvfrom`，无法在没数据时检查停止信号，也无法用 `poll` 精确控制等待超时。
+
+**Q：`setsockopt(SO_RCVBUF)` 有什么陷阱？**
+
+> **设置成功不等于生效**。Linux 内核有 `/proc/sys/net/core/rmem_max` 上限，超出时内核静默截断，`setsockopt` 不报错。必须用 `getsockopt` 反查实际值，否则缓冲区不足时包被内核丢弃且没有任何错误提示。
+
+---
+
+### 2. 线程调度（必问）
+
+**Q：接收线程为什么要用 SCHED_RR 实时调度？**
+
+> AT128 雷达约 12,000 包/秒，每包间隔约 83 微秒。CFS 默认调度延迟可达 30~40ms，会导致内核 socket 缓冲区积压溢出丢包。`SCHED_RR` 保证线程在 83 微秒内被调度到。
+
+**Q：实时线程优先级为什么设在 60%，不设最高？**
+
+> UDP softirq 负责把网卡数据写进 socket 缓冲区，它的优先级在内核侧较高。如果我们的线程优先级超过 softirq，softirq 无法运行，缓冲区不更新，`recvfrom` 永远取不到新数据——形成死锁。
+
+**Q：`pthread_setschedparam` 为什么必须在线程内部调用？**
+
+> 只能修改当前线程或有权限的其他线程的调度参数。在创建线程之前调用无效，必须在新线程的第一行调用。
+
+---
+
+### 3. 无锁队列（必问）
+
+**Q：SPSC 队列为什么不用 mutex？**
+
+> 两点原因：① SPSC 天然无竞争，不需要互斥，只需要内存屏障；② 实时线程持锁时如果普通线程也在竞争，会发生优先级反转——实时线程被卡住导致丢包。
+
+**Q：`memory_order_release/acquire` 解决了什么问题？**
+
+> 三个问题：
+> - **编译器重排**：`release` 保证 store 之前的写不会被移到 store 之后
+> - **CPU 乱序执行**：生成硬件 fence 指令（x86: `mfence`，ARM: `dmb`）
+> - **缓存可见性**：`release-store` 广播写操作给其他核，`acquire-load` 强制从全局读
+
+**Q：`alignas(64)` 加在 atomic 变量上的作用？**
+
+> 防止伪共享（False Sharing）。两个 atomic 如果在同一个 64 字节缓存行，两个核分别修改它们时会互相触发缓存行失效，性能急剧下降。`alignas(64)` 强制每个 atomic 独占一个缓存行。
+
+---
+
+### 4. epoll（可能问）
+
+**Q：故障码监听为什么用 epoll 而不用 poll？**
+
+> 故障包频率极低（每帧一个），需要长时间等待。`poll` 每次调用都遍历所有 fd，O(n) 复杂度，适合短时等待；`epoll` 内核维护事件表，O(1) 通知，适合长时间阻塞等待低频事件。
+
+---
+
+## 二、业务逻辑层
+
+### 5. 数据流（必问）
+
+**Q：从雷达 UDP 包到感知模块点云，经历了哪几步？**
+
+> ① 接收线程 `recvfrom` 拿到原始 UDP 包  
+> ② 写入无锁 SPSC 环形缓冲区  
+> ③ 处理线程拼帧（按方位角判断一帧结束）  
+> ④ 位姿插值：对每条扫描线，从位姿历史中插值出该时刻的车辆位姿  
+> ⑤ 内参校正：极坐标 → 雷达坐标系 → 车身坐标系 → 世界坐标系  
+> ⑥ 质量检查（有效点数、时钟同步）  
+> ⑦ `PublishShmMsg` 零拷贝发布给感知
+
+**Q：为什么要做位姿校正（运动补偿）？**
+
+> 雷达旋转一圈需要 100ms，车以 60km/h 行驶这段时间移动约 1.67m。如果整帧用同一个位姿，帧头的点会有 1.67m 误差，障碍物出现"拖影"。每条扫描线分别用该时刻的插值位姿，消除运动引入的畸变。
+
+**Q：内参校正的变换链是什么？**
+
+> `世界坐标 = scan.pose.ToTransform() × lidar_transform_ × (range × 单位向量)`  
+> 两个矩阵提前合并成一个，一次乘法完成两个坐标系变换。
+
+**Q：什么是局部帧（Partial Spin）？有什么用？**
+
+> 不等 360° 完整帧，每积累 128 条扫描线（约 3~4ms，1/28 圈）就发一次。感知模块不需要等 100ms，可以提前 70ms 开始处理，降低端到端感知延迟。
+
+**Q：仿真模式和真车模式有什么区别？**
+
+> 真车：数据来自 UDP socket，`OnSubscribeChannels` 只订阅 pose  
+> 仿真：数据来自 `log_lidar_spin` Lite 话题（PCAP 回放），`OnSubscribeChannels` 订阅 `LidarFrame`，但最终都经过同一个 `UpdateSpinAndPublishShm` 发布，感知看到的接口完全一样
+
+---
+
+## 三、难点与坑
+
+### 6. 面试可以主动说的难点
+
+**难点 1：`setsockopt` 静默截断**
+> 最隐蔽的 bug。缓冲区被内核截断后包丢失，但程序正常运行、无任何报错，只在高流量时偶发丢帧。排查方式：`getsockopt` 反查实际值 + 看 `netstat -su` 里的 RcvbufErrors 计数。
+
+**难点 2：SCHED_RR 权限问题**
+> 嵌入式 SoC 上可能没有 `CAP_SYS_NICE` 权限，`pthread_setschedparam` 静默失败，线程降级为 SCHED_OTHER，高负载下丢包但不报错。必须检查返回值并打日志。
+
+**难点 3：AT128 切帧角顺序**
+> AT128 不按 0° 切帧，用多个 `start_frames` 角度，且顺序敏感。顺序写错会导致同一帧数据被切成两部分，感知看到"撕裂"点云和鬼影障碍物。严格按厂商文档填写。
+
+**难点 4：CalibratedReturn 布局不能改**
+> 感知模块直接读共享内存里的 20 字节结构，如果驱动和感知是不同二进制版本（OTA 升级中间态），改了布局会读到乱数据，不崩溃但结果完全错误。用 `static_assert(sizeof(CalibratedReturn) == 20)` 保护。
+
+**难点 5：角度插值跨 ±180° 边界**
+> 偏航角从 179° 变到 -179° 实际只转了 2°，直接线性插值得到 0°，误差 180°。必须用 `NormalizeAngle` 把角度差归一化到 (-π, π] 再插值。
+
+**难点 6：位姿外推误差放大**
+> 两个相邻位姿时间戳差 < 10ms 时，外推的分母趋近于 0，微小测量误差被放大 100 倍以上。代码里向前找时间差 > 10ms 的位姿作基准，是容易被忽视的防御性代码。
+
+
+---
+
+## 四、一句话总结（面试结尾用）
+
+> SpinPublisherModule 本质上是一个**实时数据采集 + 几何变换流水线**：用实时线程从 UDP 收包，通过无锁 SPSC 队列传给处理线程，处理线程负责拼帧、运动补偿、内参校正，最终把"以传感器为中心的极坐标测量"变换成"世界坐标系下的精确三维点云"，通过共享内存零拷贝交给感知。每个设计决策——实时调度、无锁队列、预计算查找表、局部帧——都是为了在嵌入式 SoC 的资源约束下，保证 10Hz 帧率和亚毫秒级传输延迟。
+
 *学习日期：2026-06-08*  
 *参考文件：`onboard/lidar/spin_publisher_module.cc` / `spin_publisher_module.h` / `spin_structs.h`*
